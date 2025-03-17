@@ -23,7 +23,6 @@ output_folder = r'C:\Users\jayab\Duke_DLDS\GradCAM_output'
 
 os.makedirs(output_folder, exist_ok=True)
 
-
 # Load labels from CSV file
 def load_series_labels(csv_path):
     df = pd.read_csv(csv_path)
@@ -34,11 +33,9 @@ def load_series_labels(csv_path):
         series_labels[series_id] = row['Label']
     return series_labels
 
-
 labels_dict = load_series_labels(csv_path)
 class_names = sorted(list(set(labels_dict.values())))
 label_to_idx = {label: idx for idx, label in enumerate(class_names)}
-
 
 # Custom Dataset class for loading DICOM images
 class MRIDataset(Dataset):
@@ -89,7 +86,6 @@ class MRIDataset(Dataset):
 
         return img_rgb, label_to_idx[label]
 
-
 # Data transforms and loaders
 transform_pipeline = transforms.Compose([
     transforms.ToTensor(),
@@ -119,7 +115,7 @@ model.to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-# Training loop (simple example with progress bar)
+# Training loop
 model.train()
 for epoch in range(5):
     total_loss = 0.0
@@ -137,7 +133,7 @@ for epoch in range(5):
 
 torch.save(model.state_dict(), os.path.join(output_folder, 'resnet50.pth'))
 
-# Evaluation and ROC-AUC calculation (multi-class one-vs-rest)
+# Evaluation and ROC-AUC calculation
 model.eval()
 all_preds_probs, all_true_labels = [], []
 
@@ -145,52 +141,24 @@ with torch.no_grad():
     for images, labels in tqdm(test_loader):
         images = images.to(device)
         outputs = model(images)
-
         probs = torch.softmax(outputs.cpu(), dim=1).numpy()
-
         all_preds_probs.extend(probs)
         all_true_labels.extend(labels.numpy())
 
 roc_auc_ovr = roc_auc_score(all_true_labels, all_preds_probs, multi_class='ovr')
 print(f"Overall ROC-AUC Score: {roc_auc_ovr:.4f}")
 
-with open(os.path.join(output_folder, 'roc_auc.txt'), 'w') as f:
-    f.write(f"Overall ROC-AUC Score: {roc_auc_ovr:.4f}\n")
-
-# Classification report & confusion matrix visualization
-predicted_classes = np.argmax(all_preds_probs, axis=1)
-report = classification_report(all_true_labels, predicted_classes, target_names=class_names)
-with open(os.path.join(output_folder, 'classification_report.txt'), 'w') as f:
-    f.write(report)
-
-cm = confusion_matrix(all_true_labels, predicted_classes)
-plt.figure(figsize=(12, 10))
-sns.heatmap(cm, cmap='Blues', annot=True,
-            xticklabels=class_names,
-            yticklabels=class_names,
-            fmt='d')
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.title('Confusion Matrix')
-plt.tight_layout()
-plt.savefig(os.path.join(output_folder, 'confusion_matrix.png'))
-
-# Grad-CAM visualization example (first 20 test images only)
-cam = GradCAM(model=model, target_layers=[model.layer4[-1]], use_cuda=torch.cuda.is_available())
+# Grad-CAM visualization
+cam = GradCAM(model=model, target_layers=[model.layer4[-1]])
 
 for i, (img, label) in enumerate(test_loader):
     grayscale_cam = cam(input_tensor=img.to(device))[0, :]
-
-    rgb_img = np.transpose(img[0].numpy(), (1, 2, 0))
+    rgb_img = np.transpose(img[0].cpu().numpy(), (1, 2, 0))
     rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min())
-
     visualization = show_cam_on_image(rgb_img.astype(np.float32), grayscale_cam, use_rgb=True)
-
-    plt.figure(figsize=(8, 8))
     plt.imshow(visualization)
     plt.title(f"GradCAM: {class_names[label[0]]}")
     plt.axis('off')
     plt.savefig(os.path.join(output_folder, f"gradcam_{i}_{class_names[label[0]]}.png"))
-
     if i >= 19:
-        break  # limit to first 20 examples to avoid cluttering folder.
+        break
