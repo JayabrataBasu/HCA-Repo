@@ -17,7 +17,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, confusion_matrix
 
 # Define paths
-base_path = r'C:\Users\jayab\Duke_DLDS'
+base_path = r'E:\Duke_DLDS'
 segmentation_path = os.path.join(base_path, 'Segmentation', 'Segmentation')
 output_dir = os.path.join(base_path, 'alexnet_output')
 os.makedirs(output_dir, exist_ok=True)
