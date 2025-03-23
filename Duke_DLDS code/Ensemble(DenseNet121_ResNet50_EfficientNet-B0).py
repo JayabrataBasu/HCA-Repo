@@ -9,7 +9,7 @@ import pydicom
 import cv2
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torchvision.models as models
@@ -380,6 +380,23 @@ def evaluate_model(model, model_name, test_loader, device='cuda'):
     pred_labels = [idx_to_label[i] for i in all_preds]
     true_labels = [idx_to_label[i] for i in all_labels]
 
+    # Calculate metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, average='weighted')
+    recall = recall_score(all_labels, all_preds, average='weighted')
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    
+    # Save metrics to file
+    metrics_file_path = os.path.join(output_folder, f'{model_name}_metrics.txt')
+    with open(metrics_file_path, 'w') as f:
+        f.write(f"Accuracy: {accuracy:.4f}\n")
+        f.write(f"Precision: {precision:.4f}\n")
+        f.write(f"Recall: {recall:.4f}\n")
+        f.write(f"F1 Score: {f1:.4f}\n")
+    
+    # Generate bar chart for metrics
+    generate_metrics_barchart(model_name, accuracy, precision, recall, f1)
+
     # Generate classification report
     report = classification_report(true_labels, pred_labels)
     with open(os.path.join(output_folder, f'{model_name}_classification_report.txt'), 'w') as f:
@@ -397,7 +414,40 @@ def evaluate_model(model, model_name, test_loader, device='cuda'):
     plt.tight_layout()
     plt.savefig(os.path.join(output_folder, f'{model_name}_confusion_matrix.png'))
 
-    return report, cm
+    # Return metrics with the report and confusion matrix
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
+    
+    return report, cm, metrics
+
+
+# Function to generate a bar chart of metrics
+def generate_metrics_barchart(model_name, accuracy, precision, recall, f1):
+    metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score']
+    values = [accuracy, precision, recall, f1]
+    colors = ['blue', 'green', 'orange', 'red']
+    
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(metrics, values, color=colors)
+    
+    # Add value labels on top of bars
+    for bar, value in zip(bars, values):
+        plt.text(bar.get_x() + bar.get_width()/2, 
+                 bar.get_height() + 0.01, 
+                 f'{value:.4f}', 
+                 ha='center', 
+                 va='bottom')
+    
+    plt.title(f'{model_name} Performance Metrics')
+    plt.ylim(0, 1.1)  # Set y-axis limit
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f'{model_name}_metrics_barchart.png'))
+    plt.close()
 
 
 def main():
@@ -452,6 +502,8 @@ def main():
     best_val_accs = {}
 
     # Train individual models
+    metrics_results = {}  # Dictionary to store metrics for all models
+    
     for model_name in model_names:
         print(f"\n=== Training {model_name} ===")
         model = create_model(model_name, len(label_to_idx))
@@ -468,8 +520,9 @@ def main():
 
         # Evaluate individual model
         print(f"Evaluating {model_name}...")
-        report, cm = evaluate_model(model, model_name, test_loader, device=device)
-
+        report, cm, metrics = evaluate_model(model, model_name, test_loader, device=device)
+        metrics_results[model_name] = metrics
+    
     # Create and train ensemble model
     print("\n=== Creating Ensemble Model ===")
     # Load the best version of each model
@@ -495,16 +548,70 @@ def main():
 
     # Evaluate ensemble model
     print("Evaluating ensemble model...")
-    report, cm = evaluate_model(ensemble_model, "ensemble", test_loader, device=device)
-
+    report, cm, ensemble_metrics = evaluate_model(ensemble_model, "ensemble", test_loader, device=device)
+    metrics_results["ensemble"] = ensemble_metrics
+    
     # Compare performance
     print("\n=== Performance Comparison ===")
-    print(f"DenseNet121: {best_val_accs['densenet121']:.4f}")
-    print(f"ResNet50: {best_val_accs['resnet50']:.4f}")
-    print(f"EfficientNet-B0: {best_val_accs['efficientnet_b0']:.4f}")
-    print(f"Ensemble: {ensemble_best_val_acc:.4f}")
-
+    print(f"DenseNet121: {best_val_accs['densenet121']:.4f}, Test Accuracy: {metrics_results['densenet121']['accuracy']:.4f}")
+    print(f"ResNet50: {best_val_accs['resnet50']:.4f}, Test Accuracy: {metrics_results['resnet50']['accuracy']:.4f}")
+    print(f"EfficientNet-B0: {best_val_accs['efficientnet_b0']:.4f}, Test Accuracy: {metrics_results['efficientnet_b0']['accuracy']:.4f}")
+    print(f"Ensemble: {ensemble_best_val_acc:.4f}, Test Accuracy: {metrics_results['ensemble']['accuracy']:.4f}")
+    
+    # Generate combined metrics bar chart for all models
+    generate_combined_metrics_barchart(metrics_results)
+    
     print("\nTraining and evaluation complete. All outputs saved to output folder.")
+
+
+# Function to generate a combined bar chart comparing all models
+def generate_combined_metrics_barchart(metrics_results):
+    metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score']
+    model_names = list(metrics_results.keys())
+    
+    # Setup the plot
+    fig, ax = plt.figure(figsize=(15, 8)), plt.axes()
+    
+    # Calculate bar positions
+    x = np.arange(len(metrics))
+    width = 0.2  # Width of bars
+    
+    # Plot bars for each model
+    for i, model_name in enumerate(model_names):
+        model_metrics = [
+            metrics_results[model_name]['accuracy'],
+            metrics_results[model_name]['precision'],
+            metrics_results[model_name]['recall'],
+            metrics_results[model_name]['f1']
+        ]
+        
+        # Create bars with offset
+        bars = ax.bar(x + (i - len(model_names)/2 + 0.5) * width, 
+                      model_metrics, 
+                      width, 
+                      label=model_name)
+        
+        # Add value labels on top of bars
+        for bar, value in zip(bars, model_metrics):
+            ax.text(bar.get_x() + bar.get_width()/2, 
+                    bar.get_height() + 0.01, 
+                    f'{value:.4f}', 
+                    ha='center', 
+                    va='bottom',
+                    fontsize=8)
+    
+    # Configure the plot
+    ax.set_ylabel('Score')
+    ax.set_title('Model Performance Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics)
+    ax.set_ylim(0, 1.1)
+    ax.legend()
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'all_models_metrics_comparison.png'))
+    plt.close()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, confusion_matrix
+from sklearn.metrics import roc_auc_score, confusion_matrix, precision_score, recall_score, accuracy_score, f1_score
 
 # Define paths
 base_path = r'C:\Users\jayab\Duke_DLDS'
@@ -106,6 +106,7 @@ print("Loading and preprocessing images...")
 images = []
 labels = []
 metadata = []
+failed_paths = []
 
 # For demonstration, we'll use a simple binary classification:
 # 1 = Has fibrosis features (based on having valid segmentation)
@@ -131,8 +132,35 @@ for patient_id, series_id in tqdm(valid_combinations):
             'slice_id': slice_id,
             'label': label
         })
+    else:
+        failed_paths.append((patient_id, series_id))
 
 print(f"Loaded {len(images)} images")
+print(f"Failed to load {len(failed_paths)} images")
+
+# Print some samples of failed paths to help with debugging
+if len(failed_paths) > 0:
+    print("Sample of failed paths (up to 10):")
+    for path in failed_paths[:10]:
+        full_path = os.path.join(segmentation_path, path[0], path[1], 'images')
+        print(f"  - {full_path} (exists: {os.path.exists(full_path)})")
+
+# Check if we have any images to train on
+if len(images) == 0:
+    print("Error: No valid images were loaded. Please check the paths and image files.")
+    print(f"Segmentation path used: {segmentation_path}")
+    # Print a sample of expected paths
+    if valid_combinations:
+        sample = valid_combinations[0]
+        expected_path = os.path.join(segmentation_path, sample[0], sample[1], 'images')
+        print(f"Example expected path: {expected_path}")
+        print(f"This path exists: {os.path.exists(expected_path)}")
+        if os.path.exists(expected_path):
+            print(f"Files in this directory: {os.listdir(expected_path) if os.path.isdir(expected_path) else 'Not a directory'}")
+    
+    # Exit gracefully
+    import sys
+    sys.exit(1)
 
 # Convert to numpy arrays
 images = np.array(images)
@@ -306,9 +334,23 @@ binary_preds = [1 if p >= 0.5 else 0 for p in all_preds]
 # Calculate confusion matrix
 cm = confusion_matrix(all_labels, binary_preds)
 
+# Calculate additional metrics
+accuracy = accuracy_score(all_labels, binary_preds)
+precision = precision_score(all_labels, binary_preds, zero_division=0)
+recall = recall_score(all_labels, binary_preds)
+f1 = f1_score(all_labels, binary_preds)
+auc = roc_auc_score(all_labels, all_preds)
+
+# Save metrics to CSV
+metrics_df = pd.DataFrame({
+    'Metric': ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'AUC'],
+    'Value': [accuracy, precision, recall, f1, auc]
+})
+metrics_df.to_csv(os.path.join(output_dir, f'model_metrics_{timestamp}.csv'), index=False)
+
 # Plot confusion matrix
 plt.figure(figsize=(8, 6))
-plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues, aspect='auto')
 plt.title('Confusion Matrix')
 plt.colorbar()
 plt.xlabel('Predicted')
@@ -326,6 +368,26 @@ for i in range(cm.shape[0]):
 
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, f'confusion_matrix_{timestamp}.png'))
+
+# Create bar chart for metrics
+plt.figure(figsize=(10, 6))
+metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'AUC']
+values = [accuracy, precision, recall, f1, auc]
+colors = ['#3274A1', '#E1812C', '#3A923A', '#C03D3E', '#9372B2']
+
+plt.bar(metrics, values, color=colors)
+plt.title('Model Performance Metrics')
+plt.ylabel('Score')
+plt.ylim(0, 1.0)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Add text labels on top of each bar
+for i, v in enumerate(values):
+    plt.text(i, v + 0.02, f'{v:.3f}', ha='center', fontweight='bold')
+
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, f'performance_metrics_{timestamp}.png'))
+print(f"Model metrics: Accuracy={accuracy:.3f}, Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}, AUC={auc:.3f}")
 
 # Save metadata with predictions
 metadata_df = pd.DataFrame(metadata)

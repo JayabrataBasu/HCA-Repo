@@ -9,7 +9,7 @@ import pydicom
 import cv2
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, precision_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 
