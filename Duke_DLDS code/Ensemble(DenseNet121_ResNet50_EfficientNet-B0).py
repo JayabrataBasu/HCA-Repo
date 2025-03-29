@@ -10,9 +10,12 @@ import cv2
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import roc_curve, auc, roc_auc_score
+from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torchvision.models as models
+from itertools import cycle
 
 # Set paths
 root_dir = r'C:\Users\jayab\Duke_DLDS\Series_Classification\Series_Classification'
@@ -360,6 +363,7 @@ def evaluate_model(model, model_name, test_loader, device='cuda'):
     model.eval()
     all_preds = []
     all_labels = []
+    all_probs = []  # Store probabilities for ROC curve
 
     with torch.no_grad():
         for inputs, labels in tqdm(test_loader, desc=f"Evaluating {model_name}"):
@@ -370,10 +374,12 @@ def evaluate_model(model, model_name, test_loader, device='cuda'):
             label_indices = label_indices.to(device)
 
             outputs = model(inputs)
+            probabilities = torch.softmax(outputs, dim=1)
             _, predicted = torch.max(outputs, 1)
 
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(label_indices.cpu().numpy())
+            all_probs.extend(probabilities.cpu().numpy())
 
     # Convert indices back to labels for the report
     idx_to_label = {v: k for k, v in label_to_idx.items()}
@@ -386,6 +392,38 @@ def evaluate_model(model, model_name, test_loader, device='cuda'):
     recall = recall_score(all_labels, all_preds, average='weighted')
     f1 = f1_score(all_labels, all_preds, average='weighted')
     
+    # Calculate AUC-ROC
+    all_probs = np.array(all_probs)
+    all_labels_array = np.array(all_labels)
+    n_classes = len(label_to_idx)
+    
+    # Binarize labels for ROC calculation
+    y_bin = label_binarize(all_labels_array, classes=range(n_classes))
+    
+    # Compute ROC curve and ROC area for each class
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_bin[:, i], all_probs[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    
+    # Compute micro-average ROC curve and ROC area
+    fpr["micro"], tpr["micro"], _ = roc_curve(y_bin.ravel(), all_probs.ravel())
+    roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+    
+    # Store ROC data for later plotting
+    roc_data = {
+        'fpr': fpr,
+        'tpr': tpr,
+        'roc_auc': roc_auc,
+        'n_classes': n_classes
+    }
+    
+    # Plot ROC curves
+    plot_roc_curves(model_name, roc_data, label_to_idx)
+    
     # Save metrics to file
     metrics_file_path = os.path.join(output_folder, f'{model_name}_metrics.txt')
     with open(metrics_file_path, 'w') as f:
@@ -393,9 +431,13 @@ def evaluate_model(model, model_name, test_loader, device='cuda'):
         f.write(f"Precision: {precision:.4f}\n")
         f.write(f"Recall: {recall:.4f}\n")
         f.write(f"F1 Score: {f1:.4f}\n")
+        f.write(f"Micro-average AUC-ROC: {roc_auc['micro']:.4f}\n")
+        f.write("\nAUC-ROC for each class:\n")
+        for i in range(n_classes):
+            f.write(f"{idx_to_label[i]}: {roc_auc[i]:.4f}\n")
     
     # Generate bar chart for metrics
-    generate_metrics_barchart(model_name, accuracy, precision, recall, f1)
+    generate_metrics_barchart(model_name, accuracy, precision, recall, f1, roc_auc["micro"])
 
     # Generate classification report
     report = classification_report(true_labels, pred_labels)
@@ -419,19 +461,63 @@ def evaluate_model(model, model_name, test_loader, device='cuda'):
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
-        'f1': f1
+        'f1': f1,
+        'auc_roc': roc_auc["micro"],
+        'roc_data': roc_data
     }
     
     return report, cm, metrics
 
 
-# Function to generate a bar chart of metrics
-def generate_metrics_barchart(model_name, accuracy, precision, recall, f1):
-    metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score']
-    values = [accuracy, precision, recall, f1]
-    colors = ['blue', 'green', 'orange', 'red']
+# Plot ROC curves
+def plot_roc_curves(model_name, roc_data, label_to_idx):
+    fpr = roc_data['fpr']
+    tpr = roc_data['tpr']
+    roc_auc = roc_data['roc_auc']
+    n_classes = roc_data['n_classes']
     
-    plt.figure(figsize=(10, 6))
+    # Plot all ROC curves
+    plt.figure(figsize=(12, 8))
+    
+    # Plot micro-average ROC curve
+    plt.plot(fpr["micro"], tpr["micro"],
+             label=f'micro-average ROC curve (AUC = {roc_auc["micro"]:.2f})',
+             color='deeppink', linestyle=':', linewidth=4)
+    
+    # Plot ROC curves for all classes
+    colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'limegreen', 'purple', 'red', 
+                   'yellow', 'brown', 'pink', 'gray', 'olive', 'cyan'])
+    
+    idx_to_label = {v: k for k, v in label_to_idx.items()}
+    
+    for i, color in zip(range(n_classes), colors):
+        if i in roc_auc:  # Check if class i exists in roc_auc
+            plt.plot(fpr[i], tpr[i], color=color, lw=2,
+                     label=f'ROC curve of class {idx_to_label[i]} (AUC = {roc_auc[i]:.2f})')
+    
+    # Plot settings
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'{model_name} - Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save the figure
+    plt.savefig(os.path.join(output_folder, f'{model_name}_roc_curves.png'))
+    plt.close()
+
+
+# Function to generate a bar chart of metrics
+def generate_metrics_barchart(model_name, accuracy, precision, recall, f1, auc_roc):
+    metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'AUC-ROC']
+    values = [accuracy, precision, recall, f1, auc_roc]
+    colors = ['blue', 'green', 'orange', 'red', 'purple']
+    
+    plt.figure(figsize=(12, 6))
     bars = plt.bar(metrics, values, color=colors)
     
     # Add value labels on top of bars
@@ -447,6 +533,94 @@ def generate_metrics_barchart(model_name, accuracy, precision, recall, f1):
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
     plt.savefig(os.path.join(output_folder, f'{model_name}_metrics_barchart.png'))
+    plt.close()
+
+
+# Function to generate a combined bar chart comparing all models
+def generate_combined_metrics_barchart(metrics_results):
+    metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'AUC-ROC']
+    model_names = list(metrics_results.keys())
+    
+    # Setup the plot
+    fig, ax = plt.figure(figsize=(15, 8)), plt.axes()
+    
+    # Calculate bar positions
+    x = np.arange(len(metrics))
+    width = 0.2  # Width of bars
+    
+    # Plot bars for each model
+    for i, model_name in enumerate(model_names):
+        model_metrics = [
+            metrics_results[model_name]['accuracy'],
+            metrics_results[model_name]['precision'],
+            metrics_results[model_name]['recall'],
+            metrics_results[model_name]['f1'],
+            metrics_results[model_name]['auc_roc']
+        ]
+        
+        # Create bars with offset
+        bars = ax.bar(x + (i - len(model_names)/2 + 0.5) * width, 
+                      model_metrics, 
+                      width, 
+                      label=model_name)
+        
+        # Add value labels on top of bars
+        for bar, value in zip(bars, model_metrics):
+            ax.text(bar.get_x() + bar.get_width()/2, 
+                    bar.get_height() + 0.01, 
+                    f'{value:.4f}', 
+                    ha='center', 
+                    va='bottom',
+                    fontsize=8)
+    
+    # Configure the plot
+    ax.set_ylabel('Score')
+    ax.set_title('Model Performance Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics)
+    ax.set_ylim(0, 1.1)
+    ax.legend()
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'all_models_metrics_comparison.png'))
+    plt.close()
+
+
+# Function to plot combined ROC curves for all models
+def plot_combined_roc_curves(metrics_results):
+    plt.figure(figsize=(12, 8))
+    
+    colors = ['deeppink', 'blue', 'green', 'red']
+    linestyles = ['-', '--', '-.', ':']
+    
+    for (model_name, metrics), color, linestyle in zip(metrics_results.items(), colors, linestyles):
+        if 'roc_data' in metrics:
+            roc_data = metrics['roc_data']
+            # Plot micro-average ROC curve
+            plt.plot(
+                roc_data['fpr']["micro"], 
+                roc_data['tpr']["micro"],
+                label=f'{model_name} (AUC = {metrics["auc_roc"]:.4f})',
+                color=color,
+                linestyle=linestyle,
+                linewidth=2
+            )
+    
+    # Plot random chance line
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    
+    # Configure the plot
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic - Model Comparison')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'combined_roc_curves.png'))
     plt.close()
 
 
@@ -553,65 +727,18 @@ def main():
     
     # Compare performance
     print("\n=== Performance Comparison ===")
-    print(f"DenseNet121: {best_val_accs['densenet121']:.4f}, Test Accuracy: {metrics_results['densenet121']['accuracy']:.4f}")
-    print(f"ResNet50: {best_val_accs['resnet50']:.4f}, Test Accuracy: {metrics_results['resnet50']['accuracy']:.4f}")
-    print(f"EfficientNet-B0: {best_val_accs['efficientnet_b0']:.4f}, Test Accuracy: {metrics_results['efficientnet_b0']['accuracy']:.4f}")
-    print(f"Ensemble: {ensemble_best_val_acc:.4f}, Test Accuracy: {metrics_results['ensemble']['accuracy']:.4f}")
+    print(f"DenseNet121: {best_val_accs['densenet121']:.4f}, Test Accuracy: {metrics_results['densenet121']['accuracy']:.4f}, AUC-ROC: {metrics_results['densenet121']['auc_roc']:.4f}")
+    print(f"ResNet50: {best_val_accs['resnet50']:.4f}, Test Accuracy: {metrics_results['resnet50']['accuracy']:.4f}, AUC-ROC: {metrics_results['resnet50']['auc_roc']:.4f}")
+    print(f"EfficientNet-B0: {best_val_accs['efficientnet_b0']:.4f}, Test Accuracy: {metrics_results['efficientnet_b0']['accuracy']:.4f}, AUC-ROC: {metrics_results['efficientnet_b0']['auc_roc']:.4f}")
+    print(f"Ensemble: {ensemble_best_val_acc:.4f}, Test Accuracy: {metrics_results['ensemble']['accuracy']:.4f}, AUC-ROC: {metrics_results['ensemble']['auc_roc']:.4f}")
     
     # Generate combined metrics bar chart for all models
     generate_combined_metrics_barchart(metrics_results)
     
+    # Generate combined ROC curves for model comparison
+    plot_combined_roc_curves(metrics_results)
+    
     print("\nTraining and evaluation complete. All outputs saved to output folder.")
-
-
-# Function to generate a combined bar chart comparing all models
-def generate_combined_metrics_barchart(metrics_results):
-    metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score']
-    model_names = list(metrics_results.keys())
-    
-    # Setup the plot
-    fig, ax = plt.figure(figsize=(15, 8)), plt.axes()
-    
-    # Calculate bar positions
-    x = np.arange(len(metrics))
-    width = 0.2  # Width of bars
-    
-    # Plot bars for each model
-    for i, model_name in enumerate(model_names):
-        model_metrics = [
-            metrics_results[model_name]['accuracy'],
-            metrics_results[model_name]['precision'],
-            metrics_results[model_name]['recall'],
-            metrics_results[model_name]['f1']
-        ]
-        
-        # Create bars with offset
-        bars = ax.bar(x + (i - len(model_names)/2 + 0.5) * width, 
-                      model_metrics, 
-                      width, 
-                      label=model_name)
-        
-        # Add value labels on top of bars
-        for bar, value in zip(bars, model_metrics):
-            ax.text(bar.get_x() + bar.get_width()/2, 
-                    bar.get_height() + 0.01, 
-                    f'{value:.4f}', 
-                    ha='center', 
-                    va='bottom',
-                    fontsize=8)
-    
-    # Configure the plot
-    ax.set_ylabel('Score')
-    ax.set_title('Model Performance Comparison')
-    ax.set_xticks(x)
-    ax.set_xticklabels(metrics)
-    ax.set_ylim(0, 1.1)
-    ax.legend()
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_folder, 'all_models_metrics_comparison.png'))
-    plt.close()
 
 
 if __name__ == "__main__":
