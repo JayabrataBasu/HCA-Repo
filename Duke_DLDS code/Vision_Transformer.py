@@ -10,461 +10,288 @@ import pydicom
 import cv2
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, roc_auc_score
 import matplotlib.pyplot as plt
 import seaborn as sns
+from torchvision import transforms
 
-# Set paths based on your folder structure
+
+# Set paths
 root_dir = r'C:\Softwares\All Programs\HCA\Duke_DLDS\Series_Classification\Series_Classification'
 csv_path = r'C:\Softwares\All Programs\HCA\Duke_DLDS\SeriesClassificationKey.csv'
-output_folder = r'C:\Softwares\All Programs\HCA\Duke_DLDS\ViT_updated1_output'
+output_folder = r'C:\Softwares\All Programs\HCA\Duke_DLDS\ViT_improved_output'
 
 # Create output directory
 os.makedirs(output_folder, exist_ok=True)
 
+# Check if GPU is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# Load series labels from CSV
+# Load series labels
 def load_series_labels(csv_path):
     df = pd.read_csv(csv_path)
-    series_labels = {}
+    return {f"{int(row['DLDS']):04d}/{row['Series']}": row['Label'] for _, row in df.iterrows()}
 
-    for _, row in df.iterrows():
-        # Format patient ID with leading zeros
-        patient_id = f"{int(row['DLDS']):04d}"
-        series_id = f"{patient_id}/{row['Series']}"
-        series_labels[series_id] = row['Label']
-
-    return series_labels
-
-
-# Custom Dataset for DICOM images
+# Enhanced DICOM Dataset with Advanced Augmentations
 class DICOMDataset(Dataset):
     def __init__(self, root_dir, series_labels, transform=None):
-        self.root_dir = root_dir
-        self.series_labels = series_labels
         self.transform = transform
         self.samples = []
-
-        # Collect all valid samples
         for patient_id in tqdm(os.listdir(root_dir), desc="Loading dataset"):
             patient_dir = os.path.join(root_dir, patient_id)
-            if not os.path.isdir(patient_dir):
-                continue
-
-            for series_id in os.listdir(patient_dir):
-                series_dir = os.path.join(patient_dir, series_id)
-                if not os.path.isdir(series_dir):
-                    continue
-
-                # Check if this series has a label
-                full_series_id = f"{patient_id}/{series_id}"
-                if full_series_id not in series_labels:
-                    continue
-
-                # Find all DICOM files in this series
-                dicom_files = []
-                for file in os.listdir(series_dir):
-                    file_path = os.path.join(series_dir, file)
-                    if os.path.isfile(file_path):
-                        dicom_files.append(file_path)
-
-                if dicom_files:
-                    # Use the middle slice as representative of the series
-                    middle_idx = len(dicom_files) // 2
-                    self.samples.append((dicom_files[middle_idx], series_labels[full_series_id]))
+            if os.path.isdir(patient_dir):
+                for series_id in os.listdir(patient_dir):
+                    full_id = f"{patient_id}/{series_id}"
+                    if full_id in series_labels:
+                        series_dir = os.path.join(patient_dir, series_id)
+                        dicom_files = [os.path.join(series_dir, f) for f in os.listdir(series_dir)
+                                       if os.path.isfile(os.path.join(series_dir, f))]
+                        if dicom_files:
+                            self.samples.append((dicom_files[len(dicom_files) // 2], series_labels[full_id]))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-
         try:
-            # Load DICOM file
-            ds = pydicom.dcmread(img_path, force=True)
-            img = ds.pixel_array
-
-            # Convert to 3 channels (ViT expects 3 channels)
-            if len(img.shape) == 2:
-                img = np.stack([img] * 3, axis=2)
-
-            # Resize to 224x224 (standard input size for ViT)
-            img = cv2.resize(img, (224, 224))
-
-            # Normalize to [0, 1]
-            img = img / np.max(img) if np.max(img) > 0 else img
-
-            # Convert to PyTorch tensor and permute dimensions to [C, H, W]
-            img = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
-
-            # Apply any additional transformations
+            dicom_file = self.samples[idx][0]
+            img = pydicom.dcmread(dicom_file).pixel_array
+            img = cv2.resize(np.stack([img] * 3, axis=2) if img.ndim == 2 else img, (224, 224))
+            img = torch.from_numpy(img.astype(np.float32) / np.max(img))  # Fix: Use .astype() instead of .ast()
+            img = img.permute(2, 0, 1)  # Change to (C, H, W) format
             if self.transform:
                 img = self.transform(img)
-
-            return img, label
-
+            return img, self.samples[idx][1]
         except Exception as e:
-            print(f"Error processing {img_path}: {e}")
-            # Return a blank image in case of error
-            img = torch.zeros((3, 224, 224), dtype=torch.float32)
-            return img, label
+            print(f"Error loading image {self.samples[idx][0]}: {e}")
+            return torch.zeros((3, 224, 224)), self.samples[idx][1]
 
-
-# Vision Transformer Implementation
-class PatchEmbedding(nn.Module):
-    def __init__(self, image_size=224, patch_size=16, in_channels=3, embed_dim=768):
+# Improved Vision Transformer Components
+class ShiftedPatchEmbedding(nn.Module):
+    def __init__(self, image_size=224, patch_size=16, in_chans=3, embed_dim=512):
         super().__init__()
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.num_patches = (image_size // patch_size) ** 2
-
-        self.projection = nn.Conv2d(
-            in_channels, embed_dim,
-            kernel_size=patch_size, stride=patch_size
-        )
+        self.shift = patch_size // 2
+        self.proj_main = nn.Conv2d(in_chans, embed_dim // 2, kernel_size=patch_size, stride=patch_size)
+        self.proj_shift_x = nn.Conv2d(in_chans, embed_dim // 8, kernel_size=patch_size, stride=patch_size)
+        self.proj_shift_y = nn.Conv2d(in_chans, embed_dim // 8, kernel_size=patch_size, stride=patch_size)
+        self.proj_shift_xy = nn.Conv2d(in_chans, embed_dim // 8, kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Linear(embed_dim // 2 + 3 * (embed_dim // 8), embed_dim)  # Final projection
 
     def forward(self, x):
-        x = self.projection(x)  # (batch_size, embed_dim, h', w')
-        x = x.flatten(2)  # (batch_size, embed_dim, num_patches)
-        x = x.transpose(1, 2)  # (batch_size, num_patches, embed_dim)
-        return x
+        # Original projection
+        main = self.proj_main(x)
+
+        # Shifted projections
+        sx = self.proj_shift_x(x[:, :, self.shift:, self.shift:])
+        sy = self.proj_shift_y(x[:, :, :-self.shift, :-self.shift])
+        sxy = self.proj_shift_xy(x[:, :, self.shift:, :-self.shift])
+
+        # Pad shifted patches to match the size of the main patch
+        sx = torch.nn.functional.pad(sx, (0, 1, 0, 1))  # Pad to match dimensions
+        sy = torch.nn.functional.pad(sy, (0, 1, 0, 1))  # Pad to match dimensions
+        sxy = torch.nn.functional.pad(sxy, (0, 1, 0, 1))  # Pad to match dimensions
+
+        # Concatenate all patches
+        x = torch.cat([main, sx, sy, sxy], dim=1).flatten(2).transpose(1, 2)
+        return self.proj(x)  # Project to embed_dim
 
 
-class VisionTransformer(nn.Module):
-    def __init__(
-            self,
-            image_size=224,
-            patch_size=16,
-            in_channels=3,
-            num_classes=17,
-            embed_dim=768,
-            depth=12,
-            num_heads=12,
-            mlp_ratio=4.0,
-            dropout=0.1
-    ):
+class LocalitySelfAttention(nn.Module):
+    def __init__(self, dim, num_heads=8):
         super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.gamma = nn.Parameter(torch.ones(1))
+        self.register_buffer("base_mask", ~torch.eye(197).bool())  # For 224x224 images
 
-        # Patch embedding
-        self.patch_embed = PatchEmbedding(
-            image_size, patch_size, in_channels, embed_dim
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True, attn_mask=None, **kwargs):
+        # Dynamically create the mask based on the input batch size
+        batch_size = query.size(0)
+        mask = self.base_mask.unsqueeze(0).expand(batch_size, -1, -1).to(query.device)
+
+        # Pass the mask to the attention module
+        attn_out, _ = self.attn(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+            **kwargs
         )
-        num_patches = self.patch_embed.num_patches
+        return query + self.gamma * attn_out
+class VisionTransformer(nn.Module):
+    def __init__(self, image_size=224, patch_size=16, num_classes=17, embed_dim=512, depth=12,
+                 num_heads=8, mlp_ratio=3., dropout=0.2):
+        super().__init__()
+        self.patch_embed = ShiftedPatchEmbedding(image_size, patch_size, 3, embed_dim)
+        num_patches = (image_size // patch_size) ** 2
 
-        # Class token and position embeddings
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # 2D Positional Embeddings
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
 
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        # Transformer with Locality Self-Attention
+        self.blocks = nn.Sequential(*[
+            nn.TransformerEncoderLayer(embed_dim, num_heads, int(embed_dim * mlp_ratio), dropout,
+                                       activation='gelu', batch_first=True)
+            for _ in range(depth)
+        ])
+        for block in self.blocks:
+            block.self_attn = LocalitySelfAttention(embed_dim, num_heads)
 
-        # MLP head
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes)
+        self.init_weights()
 
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        # Initialize patch embedding
-        nn.init.normal_(self.patch_embed.projection.weight, std=0.02)
-
-        # Initialize position embedding and class token
-        nn.init.normal_(self.pos_embed, std=0.02)
+    def init_weights(self):
         nn.init.normal_(self.cls_token, std=0.02)
-
-        # Initialize transformer layers
+        nn.init.normal_(self.pos_embed, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                if m.bias is not None: nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # Patch embedding
-        x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
+        x = self.patch_embed(x)
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        x = self.blocks(x)
+        return self.head(self.norm(x[:, 0]))
 
-        # Add class token
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_token, x), dim=1)  # (batch_size, num_patches + 1, embed_dim)
-
-        # Add position embedding
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-
-        # Transformer encoder
-        x = self.transformer(x)
-
-        # MLP head
-        x = self.norm(x)
-        x = x[:, 0]  # Take only the class token
-        x = self.head(x)
-
-        return x
-
-
-# Training function with ReduceLROnPlateau scheduler
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=10, device='cuda'):
+# Training Infrastructure
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler=None, device='cuda', epochs=30, label_to_idx=None):
     model.to(device)
-    best_val_acc = 0.0
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    best_acc = 0.0
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'lr': []}
 
-    for epoch in range(num_epochs):
-        # Training phase
+    for epoch in range(epochs):
+        # Training
         model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} - Training"):
-            # Convert string labels to indices
-            label_indices = torch.tensor([label_to_idx[label] for label in labels], dtype=torch.long)
-
-            inputs = inputs.to(device)
-            label_indices = label_indices.to(device)
-
-            # Zero the parameter gradients
+        loss_sum, correct, total = 0, 0, 0
+        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
+            inputs, labels = inputs.to(device), torch.tensor([label_to_idx[l] for l in labels]).to(device)
             optimizer.zero_grad()
-
-            # Forward pass
             outputs = model(inputs)
-            loss = criterion(outputs, label_indices)
-
-            # Backward pass and optimize
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
-            # Statistics
-            running_loss += loss.item() * inputs.size(0)
+            loss_sum += loss.item() * inputs.size(0)
             _, predicted = torch.max(outputs, 1)
-            total += label_indices.size(0)
-            correct += (predicted == label_indices).sum().item()
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_acc = correct / total
-        history['train_loss'].append(epoch_loss)
-        history['train_acc'].append(epoch_acc)
-
-        # Validation phase
+        # Validation
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
+        val_loss, val_correct, val_total = 0, 0, 0
         with torch.no_grad():
-            for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{num_epochs} - Validation"):
-                # Convert string labels to indices
-                label_indices = torch.tensor([label_to_idx[label] for label in labels], dtype=torch.long)
-
-                inputs = inputs.to(device)
-                label_indices = label_indices.to(device)
-
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), torch.tensor([label_to_idx[l] for l in labels]).to(device)
                 outputs = model(inputs)
-                loss = criterion(outputs, label_indices)
+                val_loss += criterion(outputs, labels).item() * inputs.size(0)
+                val_correct += (torch.max(outputs, 1)[1] == labels).sum().item()
+                val_total += labels.size(0)
 
-                val_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs, 1)
-                val_total += label_indices.size(0)
-                val_correct += (predicted == label_indices).sum().item()
-
-        val_epoch_loss = val_loss / len(val_loader.dataset)
-        val_epoch_acc = val_correct / val_total
-        history['val_loss'].append(val_epoch_loss)
-        history['val_acc'].append(val_epoch_acc)
-
-        print(f"Epoch {epoch + 1}/{num_epochs} - "
-              f"Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}, "
-              f"Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}")
-
-        # Step scheduler based on validation accuracy
-        scheduler.step(val_epoch_acc)
-
-        # Print current learning rate
+        # Update metrics
+        train_loss = loss_sum / len(train_loader.dataset)
+        train_acc = correct / total
+        val_loss = val_loss / len(val_loader.dataset)
+        val_acc = val_correct / val_total
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Current learning rate: {current_lr:.6f}")
 
-        # Save the best model
-        if val_epoch_acc > best_val_acc:
-            best_val_acc = val_epoch_acc
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['lr'].append(current_lr)
+
+        print(f"Epoch {epoch + 1}: "
+              f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
+              f"LR: {current_lr:.6f}")
+
+        if scheduler:
+            scheduler.step(val_acc)
+        if val_acc > best_acc:
+            best_acc = val_acc
             torch.save(model.state_dict(), os.path.join(output_folder, 'best_model.pth'))
 
-    # Save the final model
     torch.save(model.state_dict(), os.path.join(output_folder, 'final_model.pth'))
-
-    # Plot training history
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Train Loss')
-    plt.plot(history['val_loss'], label='Validation Loss')
-    plt.title('Loss vs. Epochs')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(history['train_acc'], label='Train Accuracy')
-    plt.plot(history['val_acc'], label='Validation Accuracy')
-    plt.title('Accuracy vs. Epochs')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_folder, 'training_history.png'))
-
-    return model, history, best_val_acc
-
-
-# Evaluate the model
-def evaluate_model(model, test_loader, device='cuda'):
+# Evaluation and Visualization
+def visualize_attention(model, test_loader, device='cuda', num_images=5):
     model.eval()
-    all_preds = []
-    all_labels = []
+    os.makedirs(os.path.join(output_folder, 'attention'), exist_ok=True)
+    inputs, labels = next(iter(test_loader))
 
-    with torch.no_grad():
-        for inputs, labels in tqdm(test_loader, desc="Evaluating"):
-            # Convert string labels to indices
-            label_indices = torch.tensor([label_to_idx[label] for label in labels], dtype=torch.long)
+    for i in range(min(num_images, len(inputs))):
+        img = inputs[i].unsqueeze(0).to(device)
+        with torch.no_grad():
+            if hasattr(model.blocks[0], 'self_attn'):
+                attns = [block.self_attn(img)[1] for block in model.blocks]  # Get attention weights
+            else:
+                attns = []
 
-            inputs = inputs.to(device)
-            label_indices = label_indices.to(device)
+        plt.figure(figsize=(20, 10))
+        plt.subplot(1, len(attns) + 1, 1)
+        plt.imshow(inputs[i].permute(1, 2, 0).cpu().numpy())
+        plt.title(f"Original\nTrue: {labels[i]}")
 
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
+        for j, attn in enumerate(attns):
+            plt.subplot(1, len(attns) + 1, j + 2)
+            plt.imshow(attn[0, 0, 1:].reshape(14, 14).cpu().numpy(), cmap='jet')
+            plt.title(f"Layer {j + 1} Attention")
 
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(label_indices.cpu().numpy())
-
-    # Convert indices back to labels for the report
-    idx_to_label = {v: k for k, v in label_to_idx.items()}
-    pred_labels = [idx_to_label[i] for i in all_preds]
-    true_labels = [idx_to_label[i] for i in all_labels]
-
-    # Generate classification report
-    report = classification_report(true_labels, pred_labels)
-    with open(os.path.join(output_folder, 'classification_report.txt'), 'w') as f:
-        f.write(report)
-
-    # Generate confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    plt.figure(figsize=(15, 15))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=sorted(label_to_idx.keys()),
-                yticklabels=sorted(label_to_idx.keys()))
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Confusion Matrix')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_folder, 'confusion_matrix.png'))
-
-    # Generate normalized confusion matrix
-    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    plt.figure(figsize=(15, 15))
-    sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
-                xticklabels=sorted(label_to_idx.keys()),
-                yticklabels=sorted(label_to_idx.keys()))
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Normalized Confusion Matrix')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_folder, 'normalized_confusion_matrix.png'))
-
-    return report, cm
-
+        plt.savefig(os.path.join(output_folder, 'attention', f'attn_{i}.png'))
+        plt.close()
 
 def main():
-    # Load series labels
-    print("Loading series labels from CSV...")
+    # Data Preparation
     series_labels = load_series_labels(csv_path)
-    print(f"Loaded {len(series_labels)} series labels.")
+    dataset = DICOMDataset(root_dir, series_labels, transform=True)
+    label_to_idx = {l: i for i, l in enumerate(sorted(set(dataset.samples[i][1] for i in range(len(dataset)))))}
 
-    # Create dataset
-    print("Creating dataset...")
-    dataset = DICOMDataset(root_dir, series_labels)
-    print(f"Dataset created with {len(dataset)} samples.")
+    # Split dataset
+    train_idx, test_idx = train_test_split(range(len(dataset)), test_size=0.2, stratify=[s[1] for s in dataset.samples])
+    train_idx, val_idx = train_test_split(train_idx, test_size=0.25,
+                                          stratify=[dataset.samples[i][1] for i in train_idx])
 
-    # Create label to index mapping
-    global label_to_idx
-    unique_labels = sorted(set(label for _, label in dataset.samples))
-    label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+    # Create loaders
+    train_loader = DataLoader(dataset, batch_size=16, sampler=torch.utils.data.SubsetRandomSampler(train_idx))
+    val_loader = DataLoader(dataset, batch_size=16, sampler=torch.utils.data.SubsetRandomSampler(val_idx))
+    test_loader = DataLoader(dataset, batch_size=16, sampler=torch.utils.data.SubsetRandomSampler(test_idx))
 
-    # Save label mapping
-    with open(os.path.join(output_folder, 'label_mapping.txt'), 'w') as f:
-        for label, idx in label_to_idx.items():
-            f.write(f"{label}: {idx}\n")
-
-    # Split dataset into train, validation, and test sets
-    train_idx, test_idx = train_test_split(
-        range(len(dataset)), test_size=0.2, random_state=42,
-        stratify=[label for _, label in dataset.samples]
-    )
-
-    train_idx, val_idx = train_test_split(
-        train_idx, test_size=0.25, random_state=42,  # 0.25 * 0.8 = 0.2 of original data
-        stratify=[dataset.samples[i][1] for i in train_idx]
-    )
-
-    # Create data loaders
-    train_sampler = torch.utils.data.SubsetRandomSampler(train_idx)
-    val_sampler = torch.utils.data.SubsetRandomSampler(val_idx)
-    test_sampler = torch.utils.data.SubsetRandomSampler(test_idx)
-
-    train_loader = DataLoader(dataset, batch_size=16, sampler=train_sampler)
-    val_loader = DataLoader(dataset, batch_size=16, sampler=val_sampler)
-    test_loader = DataLoader(dataset, batch_size=16, sampler=test_sampler)
-
-    # Check if CUDA is available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Initialize model - using a smaller ViT for faster training
-    print("Initializing Vision Transformer model...")
+    # Model Configuration
     model = VisionTransformer(
-        image_size=224,
-        patch_size=16,
-        in_channels=3,
         num_classes=len(label_to_idx),
-        embed_dim=384,  # Smaller embedding dimension
-        depth=10,  # Fewer transformer blocks
-        num_heads=16,  # Fewer attention heads
-        dropout=0.1
+        embed_dim=512,
+        depth=12,
+        num_heads=8,
+        mlp_ratio=3.0,
+        dropout=0.2
+    ).to(device)
+
+    # Layer-specific Optimization
+    optimizer = optim.AdamW([
+        {'params': model.patch_embed.parameters(), 'weight_decay': 0.03},
+        {'params': model.blocks.parameters(), 'weight_decay': 0.05},
+        {'params': model.head.parameters(), 'weight_decay': 0.01}
+    ], lr=0.0001)
+
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+
+    # Training
+    model, history, best_acc = train_model(
+        model, train_loader, val_loader, nn.CrossEntropyLoss(),
+        optimizer, scheduler, device, epochs=30, label_to_idx=label_to_idx
     )
-    model.to(device)  # Move model to GPU
 
-    # Define loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.05)
-
-    # Define ReduceLROnPlateau scheduler
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
-
-    # Train the model
-    print("Starting training...")
-    model, history, best_val_acc = train_model(
-        model, train_loader, val_loader, criterion, optimizer, scheduler,
-        num_epochs=30, device=device
-    )
-
-    # Load the best model for evaluation
+    # Evaluation
     model.load_state_dict(torch.load(os.path.join(output_folder, 'best_model.pth')))
-
-    # Evaluate the model
-    print("Evaluating model...")
-    report, cm = evaluate_model(model, test_loader, device=device)
-    print("Evaluation complete. Results saved to output folder.")
-
+    visualize_attention(model, test_loader, device)
 
 if __name__ == "__main__":
     main()

@@ -5,31 +5,31 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
 from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
-from scipy.stats import skew, kurtosis
 from tqdm import tqdm
+from scipy.stats import skew, kurtosis
 
-# Define base paths
-base_path = r'C:\Users\jayab\Duke_DLDS'
-segmentation_path = os.path.join(base_path, 'Segmentation', 'Segmentation')
 
-# Create output directory
-output_dir = os.path.join(base_path, 'texture_analysis_output')
-os.makedirs(output_dir, exist_ok=True)
+# Define base path
+base_path = r'C:\Softwares\All Programs\HCA\Duke_DLDS'
+output_path = os.path.join(base_path, 'texture_analysis_output_of_series_classification_Jayabrata')
+os.makedirs(output_path, exist_ok=True)
+
+segmentation_path = os.path.join(base_path, 'Series_Classification', 'Series_Classification')
+
 
 # Create timestamp for unique filenames
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-# Load the segmentation key to get valid combinations
-key_df = pd.read_csv(os.path.join(base_path, 'SegmentationKey.csv'))
+# Load the series classification key
+series_class_df = pd.read_csv(os.path.join(base_path, 'SeriesClassificationKey.csv'))
 
-# Create a list of valid patient/series combinations
-valid_combinations = []
-for _, row in key_df.iterrows():
+# Create a dictionary to map patient/series to labels
+series_labels = {}
+for _, row in series_class_df.iterrows():
     patient_id = f"{int(row['DLDS']):04d}"
     series_id = str(row['Series'])
-    valid_combinations.append((patient_id, series_id))
-
-print(f"Found {len(valid_combinations)} valid patient/series combinations")
+    label = row['Label']
+    series_labels[(patient_id, series_id)] = label
 
 
 # Function to extract texture features from a single image
@@ -56,7 +56,7 @@ def extract_texture_features(image_array):
     correlation = np.mean(graycoprops(glcm, 'correlation'))
     ASM = np.mean(graycoprops(glcm, 'ASM'))
 
-    # LBP features (simple version)
+    # LBP features
     lbp = local_binary_pattern(image_8bit, 8, 1, method='uniform')
     lbp_hist, _ = np.histogram(lbp, bins=10, range=(0, 10), density=True)
 
@@ -90,9 +90,9 @@ processed_count = 0
 visualization_count = 0
 
 print("Starting texture analysis...")
-for patient_id, series_id in tqdm(valid_combinations, desc="Processing patients"):
+for patient_id, series_id in tqdm(series_labels.keys(), desc="Processing patients"):
     # Check if the folders exist
-    image_folder = os.path.join(segmentation_path, patient_id, series_id, 'images')
+    image_folder = os.path.join(segmentation_path, patient_id, series_id)
 
     if not os.path.exists(image_folder):
         continue
@@ -117,14 +117,15 @@ for patient_id, series_id in tqdm(valid_combinations, desc="Processing patients"
         image_array = image_dicom.pixel_array
 
         # Extract texture features
-        features = extract_texture_features(image_array)
+        feature_dict = extract_texture_features(image_array)
 
         # Add patient and series info
-        features['patient_id'] = patient_id
-        features['series_id'] = series_id
-        features['slice_id'] = image_files[middle_idx]
+        feature_dict['patient_id'] = patient_id
+        feature_dict['series_id'] = series_id
+        feature_dict['slice_id'] = image_files[middle_idx]
+        feature_dict['label'] = series_labels.get((patient_id, series_id), "Unknown")
 
-        all_features.append(features)
+        all_features.append(feature_dict)
 
         # Create visualization for first 5 processed images
         if visualization_count < 5:
@@ -137,7 +138,7 @@ for patient_id, series_id in tqdm(valid_combinations, desc="Processing patients"
             plt.imshow(image_array, cmap='gray')
             plt.axis('off')
 
-            # Display GLCM visualization (contrast)
+            # Display GLCM visualization
             plt.subplot(1, 3, 2)
             plt.title('GLCM Features')
             # Normalize for visualization
@@ -157,8 +158,8 @@ for patient_id, series_id in tqdm(valid_combinations, desc="Processing patients"
             plt.axis('off')
 
             # Save the figure
-            output_filename = f'texture_viz_{patient_id}_{series_id}_{timestamp}.png'
-            plt.savefig(os.path.join(output_dir, output_filename), dpi=300, bbox_inches='tight')
+            output_filename = f'texture_viz_{patient_id}{series_id}{timestamp}.png'
+            plt.savefig(os.path.join(output_path, output_filename), dpi=300, bbox_inches='tight')
             plt.close()
 
             visualization_count += 1
@@ -171,13 +172,13 @@ for patient_id, series_id in tqdm(valid_combinations, desc="Processing patients"
 # Save all features to CSV
 if all_features:
     features_df = pd.DataFrame(all_features)
-    output_file = os.path.join(output_dir, f'texture_features_{timestamp}.csv')
+    output_file = os.path.join(output_path, f'texture_features_{timestamp}.csv')
     features_df.to_csv(output_file, index=False)
     print(f"Features saved to {output_file}")
 
     # Generate summary statistics
     summary_stats = features_df.describe()
-    summary_file = os.path.join(output_dir, f'texture_summary_stats_{timestamp}.csv')
+    summary_file = os.path.join(output_path, f'texture_summary_stats_{timestamp}.csv')
     summary_stats.to_csv(summary_file)
     print(f"Summary statistics saved to {summary_file}")
 
@@ -191,7 +192,7 @@ if all_features:
     plt.xticks(range(len(corr.columns)), corr.columns, rotation=90)
     plt.yticks(range(len(corr.columns)), corr.columns)
     plt.tight_layout()
-    corr_file = os.path.join(output_dir, f'feature_correlation_{timestamp}.png')
+    corr_file = os.path.join(output_path, f'feature_correlation_{timestamp}.png')
     plt.savefig(corr_file, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -201,7 +202,7 @@ if all_features:
     features_df[key_features].boxplot()
     plt.title('Distribution of Key Texture Features')
     plt.tight_layout()
-    boxplot_file = os.path.join(output_dir, f'feature_boxplots_{timestamp}.png')
+    boxplot_file = os.path.join(output_path, f'feature_boxplots_{timestamp}.png')
     plt.savefig(boxplot_file, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -209,4 +210,4 @@ if all_features:
 else:
     print("No features were extracted.")
 
-print(f"Processing complete! All outputs saved to {output_dir}")
+print(f"Processing complete! All outputs saved to {output_path}")

@@ -27,12 +27,7 @@ os.makedirs(output_folder, exist_ok=True)
 # Load labels from CSV file
 def load_series_labels(csv_path):
     df = pd.read_csv(csv_path)
-    series_labels = {}
-    for _, row in df.iterrows():
-        patient_id = f"{int(row['DLDS']):04d}"
-        series_id = f"{patient_id}/{row['Series']}"
-        series_labels[series_id] = row['Label']
-    return series_labels
+    return {f"{int(row['DLDS']):04d}/{row['Series']}": row['Label'] for _, row in df.iterrows()}
 
 
 labels_dict = load_series_labels(csv_path)
@@ -58,13 +53,11 @@ class MRIDataset(Dataset):
                 if full_series_id not in labels_dict:
                     continue
 
-                dicom_files = [f for f in os.listdir(series_dir) if f.endswith('.dicom') or f.endswith('.dcm')]
-                if len(dicom_files) == 0:
-                    continue
-
-                middle_file = dicom_files[len(dicom_files) // 2]
-                img_path = os.path.join(series_dir, middle_file)
-                self.samples.append((img_path, labels_dict[full_series_id]))
+                dicom_files = [f for f in os.listdir(series_dir) if f.endswith(('.dicom', '.dcm'))]
+                if dicom_files:
+                    middle_file = dicom_files[len(dicom_files) // 2]
+                    img_path = os.path.join(series_dir, middle_file)
+                    self.samples.append((img_path, labels_dict[full_series_id]))
 
     def __len__(self):
         return len(self.samples)
@@ -74,36 +67,37 @@ class MRIDataset(Dataset):
         ds = pydicom.dcmread(img_path)
         img = ds.pixel_array.astype(np.float32)
 
-        # Normalize image to [0,1]
-        img -= np.min(img)
-        img /= np.max(img)
-
-        # Convert grayscale to RGB (3 channels)
+        # Normalize and convert to RGB
+        img = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-6)
         img_rgb = np.stack([img] * 3, axis=-1)
-
-        # Resize image to 224x224 pixels (standard size)
         img_rgb = cv2.resize(img_rgb, (224, 224))
 
         if self.transform:
-            img_rgb = self.transform(img_rgb)
+            img_transformed = self.transform(img_rgb)
+        else:
+            img_transformed = torch.from_numpy(img_rgb.transpose(2, 0, 1)).float()
 
-        return img_rgb, label_to_idx[label]
+        return img_transformed, label_to_idx[label], img_rgb  # Return original image for visualization
 
 
-# Data transforms and loaders
+# Data transforms
 transform_pipeline = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
 ])
 
 dataset = MRIDataset(root_dir=root_dir, labels_dict=labels_dict,
                      transform=transform_pipeline)
 
+# Split dataset
 train_indices, test_indices = train_test_split(
     range(len(dataset)), test_size=0.2,
-    stratify=[sample[1] for sample in dataset.samples],
-    random_state=42)
+    stratify=[dataset.samples[i][1] for i in range(len(dataset))],
+    random_state=42
+)
 
+# Create data loaders
 train_loader = DataLoader(dataset, batch_size=16,
                           sampler=torch.utils.data.SubsetRandomSampler(train_indices))
 test_loader = DataLoader(dataset, batch_size=8,
@@ -119,11 +113,12 @@ model.to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-# Training loop (simple example with progress bar)
+# Training loop with loss tracking
+train_losses = []
 model.train()
 for epoch in range(5):
-    total_loss = 0.0
-    for images, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}/5"):
+    epoch_loss = 0.0
+    for images, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch + 1}/5"):
         images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
@@ -132,65 +127,109 @@ for epoch in range(5):
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
-    print(f"Epoch {epoch + 1} Loss: {total_loss / len(train_loader):.4f}")
+        epoch_loss += loss.item() * images.size(0)
 
+    avg_loss = epoch_loss / len(train_loader.dataset)
+    train_losses.append(avg_loss)
+    print(f"Epoch {epoch + 1} Loss: {avg_loss:.4f}")
+
+# Save training curve
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, 6), train_losses, marker='o')
+plt.title("Training Loss Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.xticks(range(1, 6))
+plt.savefig(os.path.join(output_folder, "training_loss.png"))
+plt.close()
+
+# Save model
 torch.save(model.state_dict(), os.path.join(output_folder, 'resnet50.pth'))
 
-# Evaluation and ROC-AUC calculation (multi-class one-vs-rest)
+# Evaluation and ROC-AUC calculation
 model.eval()
-all_preds_probs, all_true_labels = [], []
+all_preds_probs = []
+all_true_labels = []
 
 with torch.no_grad():
-    for images, labels in tqdm(test_loader):
+    for images, labels, _ in tqdm(test_loader):
         images = images.to(device)
         outputs = model(images)
-
         probs = torch.softmax(outputs.cpu(), dim=1).numpy()
-
         all_preds_probs.extend(probs)
         all_true_labels.extend(labels.numpy())
 
 roc_auc_ovr = roc_auc_score(all_true_labels, all_preds_probs, multi_class='ovr')
 print(f"Overall ROC-AUC Score: {roc_auc_ovr:.4f}")
 
-with open(os.path.join(output_folder, 'roc_auc.txt'), 'w') as f:
-    f.write(f"Overall ROC-AUC Score: {roc_auc_ovr:.4f}\n")
+# Grad-CAM visualization
+cam = GradCAM(model=model, target_layers=[model.layer4[-1]])
 
-# Classification report & confusion matrix visualization
-predicted_classes = np.argmax(all_preds_probs, axis=1)
-report = classification_report(all_true_labels, predicted_classes, target_names=class_names)
-with open(os.path.join(output_folder, 'classification_report.txt'), 'w') as f:
-    f.write(report)
+# Create Grad-CAM output directory
+gradcam_dir = os.path.join(output_folder, "gradcam_results")
+os.makedirs(gradcam_dir, exist_ok=True)
 
-cm = confusion_matrix(all_true_labels, predicted_classes)
-plt.figure(figsize=(12, 10))
-sns.heatmap(cm, cmap='Blues', annot=True,
-            xticklabels=class_names,
-            yticklabels=class_names,
-            fmt='d')
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.title('Confusion Matrix')
+# Process first 20 test samples
+for idx, (images, labels, orig_images) in enumerate(test_loader):
+    if idx >= 20 // images.size(0):  # Process up to 20 samples
+        break
+
+    # Get Grad-CAM heatmaps
+    grayscale_cams = cam(input_tensor=images.to(device))
+
+    for i in range(images.size(0)):
+        # Denormalize image
+        img_np = orig_images[i].astype(np.float32) / 255.0
+
+        # Get heatmap and overlay
+        heatmap = grayscale_cams[i]
+        visualization = show_cam_on_image(img_np, heatmap, use_rgb=True)
+
+        # Create figure
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Original image
+        ax1.imshow(img_np)
+        ax1.set_title(f"Original\n{class_names[labels[i]]}")
+        ax1.axis('off')
+
+        # Heatmap
+        ax2.imshow(heatmap, cmap='jet')
+        ax2.set_title("Grad-CAM Heatmap")
+        ax2.axis('off')
+
+        # Overlay
+        ax3.imshow(visualization)
+        ax3.set_title("Grad-CAM Overlay")
+        ax3.axis('off')
+
+        # Save visualization
+        plt.tight_layout()
+        plt.savefig(os.path.join(gradcam_dir, f"gradcam_{idx * images.size(0) + i}_{class_names[labels[i]]}.png"))
+        plt.close()
+
+# Generate and save confusion matrix
+model.eval()
+all_preds = []
+all_labels = []
+
+with torch.no_grad():
+    for images, labels, _ in test_loader:
+        images = images.to(device)
+        outputs = model(images)
+        preds = torch.argmax(outputs, dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(labels.numpy())
+
+cm = confusion_matrix(all_labels, all_preds)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.xticks(rotation=45)
+plt.yticks(rotation=0)
 plt.tight_layout()
-plt.savefig(os.path.join(output_folder, 'confusion_matrix.png'))
-
-# Grad-CAM visualization example (first 20 test images only)
-cam = GradCAM(model=model, target_layers=[model.layer4[-1]], use_cuda=torch.cuda.is_available())
-
-for i, (img, label) in enumerate(test_loader):
-    grayscale_cam = cam(input_tensor=img.to(device))[0, :]
-
-    rgb_img = np.transpose(img[0].numpy(), (1, 2, 0))
-    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min())
-
-    visualization = show_cam_on_image(rgb_img.astype(np.float32), grayscale_cam, use_rgb=True)
-
-    plt.figure(figsize=(8, 8))
-    plt.imshow(visualization)
-    plt.title(f"GradCAM: {class_names[label[0]]}")
-    plt.axis('off')
-    plt.savefig(os.path.join(output_folder, f"gradcam_{i}_{class_names[label[0]]}.png"))
-
-    if i >= 19:
-        break  # limit to first 20 examples to avoid cluttering folder.
+plt.savefig(os.path.join(output_folder, "confusion_matrix.png"))
+plt.close()
