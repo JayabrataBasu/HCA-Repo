@@ -565,7 +565,7 @@ def train_attention_ensemble(ensemble_model, train_loader, val_loader, criterion
         # Print attention weights
         model_names = ['densenet121', 'resnet50', 'efficientnet_b0', 'vit_b_16']
         print("Model attention weights:")
-        for i, weight in enumerate(avg_attention.cpu().numpy()):
+        for i, weight in enumerate(avg_attention.detach().cpu().numpy()):
             print(f"  {model_names[i]}: {weight:.4f}")
 
         # Save the best model
@@ -576,7 +576,7 @@ def train_attention_ensemble(ensemble_model, train_loader, val_loader, criterion
             # Save attention weights
             weights_df = pd.DataFrame({
                 'model': model_names,
-                'weight': avg_attention.cpu().numpy()
+                'weight': avg_attention.detach().cpu().numpy()
             })
             weights_df.to_csv(os.path.join(output_folder, 'best_attention_weights.csv'), index=False)
 
@@ -612,7 +612,7 @@ def train_attention_ensemble(ensemble_model, train_loader, val_loader, criterion
     
     # Create a bar chart of final attention weights
     plt.subplot(2, 2, 4)
-    plt.bar(model_names, avg_attention.cpu().numpy())
+    plt.bar(model_names, avg_attention.detach().cpu().numpy())
     plt.title('Model Attention Weights')
     plt.ylabel('Weight')
     plt.xticks(rotation=45)
